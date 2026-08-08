@@ -1,0 +1,736 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>COPD</title>
+<style>
+  /* One place defining how much vertical space the chrome below the canvas
+     takes. Three separate copies of a magic number drifted the moment the
+     HUD grew. */
+  :root { --chrome: 108px; --play: min(100%, (100dvh - var(--chrome)) * 3 / 4); }
+
+  html { overflow: hidden; }   /* the slam animation must never scroll the page */
+  body { margin: 0; background: #14121a; color: #cfc8dd;
+         font: 14px system-ui, sans-serif; height: 100dvh;
+         display: flex; flex-direction: column; align-items: center;
+         justify-content: center; gap: 8px; padding: 8px;
+         box-sizing: border-box; overscroll-behavior: none;
+         overflow: hidden; }
+
+  /* Scale to whichever axis binds first, preserving the playfield aspect. */
+  /* flex: none — as a flex item in a centred column it would otherwise
+     shrink-wrap, collapsing the canvas to zero. */
+  #stage { width: var(--play); flex: none; }
+  canvas { display: block; width: 100%; aspect-ratio: 3 / 4;
+           border-radius: 8px; touch-action: none; border: 1px solid #2e2938; }
+  #hud { width: var(--play);
+         display: flex; align-items: center; gap: 12px;
+         background: #1b1823; border: 1px solid #2e2938; border-radius: 8px;
+         padding: 8px 12px; box-sizing: border-box; }
+
+  /* Phones: portrait is far taller than 4:3, so a width-capped canvas wastes
+     most of the screen. Go full width and let the playfield be taller than
+     wide — the lung is a portrait shape anyway. */
+  @media (max-width: 560px) {
+    :root { --chrome: 112px; }
+    body { justify-content: center; gap: 6px; padding: 6px; }
+    #stage { flex: none; }
+    #hud { flex-wrap: wrap; gap: 8px 10px; }
+    #meter { flex: 1 1 100%; order: -1; }
+    #status { display: none; }
+    #diag { display: none; }
+  }
+
+  /* Disease meter: fills and shifts hue as the lungs degrade. */
+  #meter { flex: 1; min-width: 0; }
+  #meter .label { display: flex; justify-content: space-between;
+                  font-size: 11px; letter-spacing: .08em;
+                  text-transform: uppercase; color: #8d84a0; margin-bottom: 4px; }
+  #bar { height: 8px; border-radius: 4px; background: #2a2533; overflow: hidden; }
+  #fill { height: 100%; width: 0; border-radius: 4px;
+          background: linear-gradient(90deg, #e06a72, #b8484f);
+          transition: width .25s ease; }
+
+  /* Active-effect chips, shown only while the effect is live. */
+  #effects { display: flex; gap: 6px; }
+  .chip { font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+          padding: 4px 9px; border-radius: 999px; white-space: nowrap;
+          border: 1px solid currentColor; }
+  .chip.radiologist { color: #8ce4ff; }
+  .chip.pierce { color: #d8dcda; }
+  .chip.hidden { display: none; }
+
+  #status { font-size: 12px; color: #8d84a0; min-width: 8ch; }
+  #restart { font: inherit; font-size: 12px; padding: 6px 14px;
+             border-radius: 6px; border: 1px solid #453e52;
+             background: #262130; color: #cfc8dd; cursor: pointer; }
+  #restart:hover { background: #322b3d; }
+  /* Pickup announcement. HTML overlay rather than glyphs in the shader —
+     text in GLSL needs a font atlas, which is a lot for four words.
+     Overlay text is sized in cqw against #stage, not vw: on a phone the
+     canvas is far narrower than the viewport, so vw overshoots badly. */
+  #stage { position: relative; container-type: inline-size; }
+  #slam { position: absolute; inset: 0; display: grid; place-content: center;
+          pointer-events: none; text-align: center; opacity: 0;
+          padding: 0 6%; box-sizing: border-box; overflow: hidden; }
+  #slam .name { font-size: clamp(18px, 7cqw, 38px); font-weight: 900;
+                letter-spacing: .04em; text-transform: uppercase;
+                line-height: 1.05; color: #fff2f2; overflow-wrap: break-word;
+                text-shadow: 0 0 18px currentColor, 0 3px 0 #00000080; }
+  #slam .blurb { margin-top: 8px; font-size: clamp(9px, 2.4cqw, 13px);
+                 letter-spacing: .14em; text-transform: uppercase;
+                 line-height: 1.3; color: #e8dff5;
+                 text-shadow: 0 2px 6px #000; }
+  /* Slam in fast, hang, then fade. `forwards` keeps the end state so it
+     stays hidden until the next catch retriggers the animation. */
+  @keyframes slam {
+      0% { opacity: 0; transform: scale(1.9) rotate(-5deg); filter: blur(4px); }
+     12% { opacity: 1; transform: scale(0.94) rotate(0deg); filter: blur(0); }
+     20% { transform: scale(1.06); }
+     28% { transform: scale(1); }
+     72% { opacity: 1; transform: scale(1); }
+    100% { opacity: 0; transform: scale(1.15); }
+  }
+  #slam.go { animation: slam 1.5s cubic-bezier(.2,.8,.3,1) forwards; }
+  @media (prefers-reduced-motion: reduce) {
+    #slam.go { animation: slam 1.5s step-end forwards; }
+  }
+  /* End-of-game panel. Sits over the canvas and dims it. */
+  #over { position: absolute; inset: 0; display: grid; place-content: center;
+          gap: 6px; text-align: center; border-radius: 8px;
+          background: #100d17cc; backdrop-filter: blur(2px);
+          opacity: 0; pointer-events: none; transition: opacity .4s;
+          padding: 0 6%; box-sizing: border-box; }
+  #over.show { opacity: 1; pointer-events: auto; }
+  #over .title { font-size: clamp(22px, 8cqw, 44px); font-weight: 900;
+                 letter-spacing: .04em; text-transform: uppercase;
+                 line-height: 1.05; }
+  /* Colours deliberately fight the words. Clearing the board is a win the
+     colour celebrates in green while the copy mourns; losing the ball is a
+     failure the colour scolds in red while the copy quietly congratulates you
+     on still having lungs. The dissonance is the joke. */
+  #over.win .title { color: #7fe0a4; text-shadow: 0 0 24px #7fe0a480; }
+  #over.lose .title { color: #ff7a80; text-shadow: 0 0 24px #ff7a8080; }
+  #over .sub { font-size: clamp(10px, 2.6cqw, 14px); color: #c3b9d6;
+               letter-spacing: .12em; text-transform: uppercase; }
+  #over .stats { margin-top: 10px; font-size: clamp(11px, 2.8cqw, 15px);
+                 color: #efe9f8; font-variant-numeric: tabular-nums; }
+  #over button { margin-top: 14px; justify-self: center; font: inherit;
+                 font-size: clamp(11px, 2.8cqw, 14px); padding: 8px 22px;
+                 border-radius: 6px; border: 1px solid #6b5f7d;
+                 background: #2c2538; color: #efe9f8; cursor: pointer; }
+  #over button:hover { background: #3a3149; }
+  #diag { width: var(--play);
+          font-size: 10px; color: #55506080; text-align: right;
+          font-family: ui-monospace, monospace; }
+</style>
+
+<div id="stage">
+  <canvas id="c"></canvas>
+  <div id="slam"><div class="name"></div><div class="blurb"></div></div>
+  <div id="over">
+    <div class="title"></div>
+    <div class="sub"></div>
+    <div class="stats"></div>
+    <button id="again">play again</button>
+  </div>
+</div>
+<div id="hud">
+  <div id="meter">
+    <div class="label"><span>Lung damage</span><span id="pct">0%</span></div>
+    <div id="bar"><div id="fill"></div></div>
+  </div>
+  <div id="effects">
+    <span class="chip radiologist hidden" id="chip-radiologist">radiologist</span>
+    <span class="chip pierce hidden" id="chip-pierce">asbestos</span>
+  </div>
+  <span id="status">drag to aim</span>
+  <button id="restart">restart</button>
+</div>
+<div id="diag"></div>
+
+<script type="module">
+import init, { GameHandle, dimensions } from './pkg/copd.js';
+
+// One quad, reused for every instance. gl_VertexID would work too, but an
+// explicit buffer keeps the attribute layout uniform.
+const QUAD = new Float32Array([0,0, 1,0, 0,1, 1,1]);
+
+const VERT = `#version 300 es
+layout(location=0) in vec2 corner;   // per-vertex: unit quad
+layout(location=1) in vec4 rect;     // per-instance: x, y, w, h
+layout(location=2) in float kind;    // per-instance: 0 lung 1 merged 2 cig 3 ball 4 pickup 5 trachea
+layout(location=3) in float burn;    // per-instance: 0 intact, 0->1 burning away
+uniform vec2 res;
+out float v_kind;
+out float v_burn;
+out vec2 v_uv;
+out vec2 v_px;    // world position, so noise is continuous across cell borders
+void main() {
+  v_kind = kind;
+  v_burn = burn;
+  v_uv = corner;
+  vec2 px = rect.xy + corner * rect.zw;
+  v_px = px;
+  // pixel space -> clip space, y flipped so (0,0) is top-left like canvas
+  gl_Position = vec4((px / res * 2.0 - 1.0) * vec2(1.0, -1.0), 0.0, 1.0);
+}`;
+
+const FRAG = `#version 300 es
+// highp, not mediump: on mobile GPUs mediump really is 16-bit (max ~65504),
+// and the noise hash multiplies by 43758 — which overflows and flattens all
+// the tissue detail to a constant. Desktop silently promotes to 32-bit, so
+// this only shows up on a phone.
+precision highp float;
+in float v_kind;
+in float v_burn;
+in vec2 v_uv;
+in vec2 v_px;
+uniform float copd;
+uniform float time;
+out vec4 color;
+
+// --- procedural texture: hash -> value noise -> fbm ---------------------
+// No texture upload anywhere. Every pixel derives its own detail from its
+// world position, so the pattern is continuous across cell borders and
+// costs no memory.
+
+float hash(vec2 p) {
+  // Wrap into a small range first. The classic sin-fract hash feeds the raw
+  // coordinate into sin(), and at v_px ~800 the argument is large enough that
+  // precision loss makes the output banded — flat on mobile, subtly wrong on
+  // desktop. Keeping the input near the origin avoids relying on precision.
+  p = fract(p * 0.0139);
+  p += dot(p, p + 41.7);
+  return fract((p.x + p.y) * p.x * 71.3);
+}
+
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);            // smoothstep the interpolant
+  return mix(mix(hash(i),               hash(i + vec2(1,0)), f.x),
+             mix(hash(i + vec2(0,1)),   hash(i + vec2(1,1)), f.x), f.y);
+}
+
+// Fractal brownian motion: octaves of noise at doubling frequency,
+// halving amplitude. Three octaves is plenty at this scale.
+float fbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 3; i++) { v += a * noise(p); p *= 2.0; a *= 0.5; }
+  return v;
+}
+
+// Signed distance to a rounded box, for cell shape.
+float roundedBox(vec2 p, vec2 half_, float r) {
+  vec2 q = abs(p) - half_ + r;
+  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+void main() {
+  int k = int(v_kind + 0.5);
+  float burn = v_burn;
+  bool burning = (k == 6);
+  bool tissue = (k <= 1 || k == 5 || burning);
+
+  vec3 c;
+  if (k == 0)      c = mix(vec3(0.90,0.42,0.46), vec3(0.45,0.40,0.44), copd);
+  else if (k == 1) c = mix(vec3(0.62,0.33,0.39), vec3(0.30,0.27,0.31), copd);
+  else if (k == 2) c = vec3(0.95,0.93,0.85);
+  else if (k == 3) c = vec3(1.00,0.75,0.35);
+  else if (k == 5) c = mix(vec3(0.78,0.72,0.80), vec3(0.50,0.48,0.54), copd);
+  else if (k == 6) c = mix(vec3(0.90,0.42,0.46), vec3(0.45,0.40,0.44), copd);
+  else             c = vec3(0.60,0.85,0.55);  // pickup
+
+  if (tissue) {
+    // Alveolar speckle, sampled in world space at two scales.
+    float fine   = fbm(v_px * 0.42);
+    float coarse = fbm(v_px * 0.11 + 13.0);
+
+    // Mottling: coarse blotches shift hue, fine grain shifts value.
+    c *= 0.86 + 0.28 * fine;
+    c = mix(c, c * vec3(1.10, 0.86, 0.90), coarse * 0.55);
+
+    // Wet sheen towards the top-left of each cell.
+    float sheen = pow(max(0.0, 1.0 - length(v_uv - vec2(0.32, 0.28))), 3.0);
+    c += sheen * 0.16 * (1.0 - copd);
+
+    // Diseased tissue picks up dark tar flecks.
+    float tar = smoothstep(0.62, 0.82, fbm(v_px * 0.9 + 41.0));
+    c = mix(c, c * 0.42, tar * copd * 0.85);
+
+    // Breathing: a slow global brightness pulse, faltering as COPD advances.
+    float breath = sin(time * (1.9 - 0.7 * copd)) * 0.5 + 0.5;
+    c *= 0.97 + 0.05 * breath * (1.0 - 0.5 * copd);
+
+    // Depth: darken towards the cell edge so blocks read as rounded volume.
+    vec2 d2 = min(v_uv, 1.0 - v_uv);
+    float edge = min(d2.x, d2.y);
+    c *= 0.74 + 0.26 * smoothstep(0.0, 0.30, edge);
+  }
+
+  // --- burn-up ---------------------------------------------------------
+  // The cell is eaten away by a noise threshold sweeping 0->1. Pixels below
+  // the threshold are gone; those just above it glow as the burning edge.
+  // Runs after texturing, so a burning cell chars the tissue it actually was.
+  if (burning) {
+    float grain = fbm(v_px * 0.55 + 7.0);
+    // Bias the sweep by grain so the hole is ragged, not a clean shrink.
+    float eaten = burn * 1.35 - grain * 0.35;
+
+    float sd = roundedBox(v_uv - 0.5, vec2(0.47), 0.16);
+    float aa = fwidth(sd) + 1e-4;
+    float alpha = 1.0 - smoothstep(-aa, aa, sd);
+    alpha *= 1.0 - smoothstep(0.0, 0.12, eaten);
+    if (alpha < 0.02) discard;
+
+    // Ember rim just ahead of the burn front.
+    float rim = smoothstep(-0.14, 0.0, eaten) * (1.0 - smoothstep(0.0, 0.10, eaten));
+    vec3 ember = mix(vec3(1.0,0.45,0.10), vec3(1.0,0.88,0.45), grain);
+    c = mix(c * (1.0 - burn * 0.55), ember, rim * 0.85);
+    // Char what hasn't burnt yet.
+    c = mix(c, vec3(0.10,0.08,0.09), smoothstep(0.25, 0.95, burn) * 0.7);
+
+    color = vec4(c, alpha);
+    return;
+  }
+
+  // --- shape -----------------------------------------------------------
+  if (tissue) {
+    // Rounded cell with an antialiased edge, instead of a hard 1px gap.
+    float sd = roundedBox(v_uv - 0.5, vec2(0.47), 0.16);
+    float aa = fwidth(sd) + 1e-4;
+    float alpha = 1.0 - smoothstep(-aa, aa, sd);
+    if (alpha < 0.02) discard;
+    color = vec4(c, alpha);
+    return;
+  }
+
+  if (k == 3) {
+    // Ball: antialiased disc with a hot core.
+    float sd = length(v_uv - 0.5) - 0.5;
+    float aa = fwidth(sd) + 1e-4;
+    float alpha = 1.0 - smoothstep(-aa, aa, sd);
+    if (alpha < 0.02) discard;
+    c += pow(max(0.0, 1.0 - length(v_uv - vec2(0.38, 0.36)) * 2.2), 2.0) * 0.5;
+    color = vec4(c, alpha);
+    return;
+  }
+
+  if (k == 2) {
+    // Cigarette: paper body with a burning tip and an ember glow.
+    float tip = smoothstep(0.80, 0.88, v_uv.x);
+    vec3 ember = mix(vec3(0.85,0.25,0.10), vec3(1.0,0.85,0.45),
+                     0.5 + 0.5 * sin(time * 9.0));
+    c = mix(c, ember, tip);
+    c *= 0.90 + 0.10 * (1.0 - abs(v_uv.y - 0.5) * 2.0);  // cylinder shading
+    color = vec4(c, 1.0);
+    return;
+  }
+
+  // Pleura: the membrane lining the chest wall. Two layers (parietal outside,
+  // visceral inside) with the pleural cavity between them. v_burn selects the
+  // axis: 0 for the side walls, 1 for the apex.
+  if (k == 8) {
+    float across = v_burn > 0.5 ? v_uv.y : min(v_uv.x, 1.0 - v_uv.x) * 2.0;
+    float along  = v_burn > 0.5 ? v_uv.x : v_uv.y;
+
+    // Outer rib layer, banded so it reads as chest wall.
+    vec3 rib = vec3(0.30, 0.26, 0.32);
+    float ribs = sin(along * (v_burn > 0.5 ? 46.0 : 34.0));
+    rib += smoothstep(0.55, 1.0, ribs) * 0.16;
+
+    // Fluid film between the layers, slowly drifting.
+    float film = fbm(vec2(along * 26.0, time * 0.35));
+    vec3 fluid = mix(vec3(0.20, 0.30, 0.38), vec3(0.32, 0.46, 0.54), film);
+
+    // Blend outer -> inner across the thickness.
+    vec3 c8 = mix(rib, fluid, smoothstep(0.35, 1.0, across));
+    // Inner boundary highlight: the visceral surface catching the light.
+    c8 += (1.0 - smoothstep(0.0, 0.14, 1.0 - across)) * 0.30;
+    // Air leaking into the cavity as the disease advances.
+    c8 = mix(c8, vec3(0.12, 0.12, 0.16), copd * 0.45);
+
+    color = vec4(c8, 1.0);
+    return;
+  }
+
+  // X-ray trail dot. v_burn carries the fraction along the path, so the
+  // trail fades toward its far end.
+  if (k == 7) {
+    float sd = length(v_uv - 0.5) - 0.5;
+    float aa = fwidth(sd) + 1e-4;
+    float a = 1.0 - smoothstep(-aa, aa, sd);
+    a *= 0.85 - 0.55 * v_burn;
+    if (a < 0.02) discard;
+    // Cyan, like a contrast-enhanced scan.
+    color = vec4(vec3(0.55, 0.90, 1.0), a);
+    return;
+  }
+
+  // --- pickup sprites ---------------------------------------------------
+  // Each kind gets a distinct silhouette so it's identifiable while falling,
+  // drawn procedurally from v_uv. No texture atlas.
+  float pulse = 0.5 + 0.5 * sin(time * 5.0);
+  vec2 p = v_uv;
+  float alpha = 1.0;
+
+  if (k == 10) {
+    // Cigarettes: an open pack with three cigarettes standing out of the top.
+    // Silhouette first, so the shape reads before any detail.
+    vec2 q = p - 0.5;
+
+    // Pack body occupies the lower two thirds.
+    float pack = roundedBox(q - vec2(0.0, 0.16), vec2(0.34, 0.30), 0.04);
+    // Three cigarettes rising from behind it.
+    float cigs = 1e9;
+    for (int i = 0; i < 3; i++) {
+      float cx = (float(i) - 1.0) * 0.20;
+      cigs = min(cigs, roundedBox(q - vec2(cx, -0.26), vec2(0.065, 0.22), 0.03));
+    }
+    float sd = min(pack, cigs);
+    alpha = 1.0 - smoothstep(-fwidth(sd), fwidth(sd), sd);
+    if (alpha < 0.02) discard;
+
+    if (cigs < pack) {
+      // Cigarette: white paper with an orange filter at the bottom.
+      float filt = smoothstep(-0.16, -0.10, q.y);
+      c = mix(vec3(0.96, 0.94, 0.88), vec3(0.85, 0.62, 0.32), filt);
+      // Lit tip glowing at the very top.
+      c = mix(c, vec3(1.0, 0.55, 0.20), smoothstep(-0.46, -0.42, -q.y)
+                                        * (0.6 + 0.4 * pulse));
+    } else {
+      // Pack: red body, white band across the lower third.
+      c = vec3(0.82, 0.20, 0.22);
+      if (q.y > 0.24) c = vec3(0.94, 0.92, 0.86);
+      // Lid seam.
+      if (abs(q.y - 0.00) < 0.012) c *= 0.72;
+    }
+  } else if (k == 11) {
+    // Pneumothorax: two lung lobes, the right one collapsed away from the
+    // chest wall with air in the gap.
+    vec2 q = p - 0.5;
+    float side = sign(q.x);
+    float ax = abs(q.x);
+
+    // Intact left lobe / shrunken right lobe.
+    float shrink = side > 0.0 ? 0.55 : 1.0;
+    vec2 lobeC = vec2(side * 0.20, 0.02);
+    vec2 lobeR = vec2(0.17, 0.32) * shrink;
+    float lobe = length((q - lobeC) / lobeR) - 1.0;
+
+    // Chest wall outline, always full size — the gap is the point.
+    float wall = length(q / vec2(0.44, 0.46)) - 1.0;
+
+    float sd = min(lobe, abs(wall) - 0.035);
+    alpha = 1.0 - smoothstep(-fwidth(sd), fwidth(sd), sd);
+    if (alpha < 0.02) discard;
+
+    if (lobe < abs(wall) - 0.035) {
+      c = side > 0.0 ? vec3(0.55, 0.42, 0.48) : vec3(0.88, 0.45, 0.50);
+    } else {
+      c = vec3(0.72, 0.76, 0.86);
+    }
+    // Air escaping into the gap on the collapsed side.
+    if (side > 0.0 && lobe > 0.0) {
+      float r = length(q - lobeC);
+      c += smoothstep(0.7, 1.0, sin(r * 40.0 - time * 6.0)) * 0.30;
+    }
+  } else if (k == 13) {
+    // Radiologist: a chest film — dark plate, pale ribs, bright scan line.
+    vec2 q = p - 0.5;
+    float sd = roundedBox(q, vec2(0.44), 0.05);
+    alpha = 1.0 - smoothstep(-fwidth(sd), fwidth(sd), sd);
+    if (alpha < 0.02) discard;
+
+    c = vec3(0.07, 0.11, 0.16);
+    // Film border.
+    if (sd > -0.05) c = vec3(0.45, 0.80, 0.95);
+
+    // Two lung fields as darker ovals.
+    float lung = min(length((q - vec2(-0.17, 0.02)) / vec2(0.13, 0.26)),
+                     length((q - vec2( 0.17, 0.02)) / vec2(0.13, 0.26))) - 1.0;
+    if (lung < 0.0) c = vec3(0.12, 0.20, 0.28);
+
+    // Ribs: arcs crossing the lung fields.
+    float ribs = sin((q.y + 0.32) * 26.0);
+    if (lung < 0.0) c += smoothstep(0.75, 1.0, ribs) * vec3(0.35, 0.55, 0.65);
+
+    // Spine down the middle.
+    if (abs(q.x) < 0.035) c = mix(c, vec3(0.55, 0.70, 0.80), 0.7);
+
+    // Scan line sweeping down.
+    float scan = fract(time * 0.6) - 0.5;
+    c += (1.0 - smoothstep(0.0, 0.05, abs(q.y - scan))) * vec3(0.4, 0.95, 1.0) * 0.7;
+  } else if (k == 12) {
+    // Asbestos: sharp needle-like fibres in a splayed bundle.
+    float f = 1e9;
+    vec2 q = p - 0.5;
+    for (int i = 0; i < 4; i++) {
+      float t = (float(i) - 1.5) / 1.5;          // -1 .. 1
+      // Rotate each fibre slightly so they splay rather than sit parallel.
+      float a = t * 0.30;
+      vec2 r = vec2(q.x * cos(a) - q.y * sin(a), q.x * sin(a) + q.y * cos(a));
+      // Taper: thick at the centre, sharp at both ends.
+      float taper = 0.055 * (1.0 - abs(r.x) / 0.46);
+      f = min(f, abs(r.y - t * 0.13) - max(taper, 0.0));
+    }
+    float sd = max(f, abs(q.x) - 0.46);
+    alpha = 1.0 - smoothstep(-fwidth(sd), fwidth(sd), sd);
+    if (alpha < 0.02) discard;
+    // Mineral glint travelling along the fibres.
+    float glint = 0.5 + 0.5 * sin(q.x * 14.0 - time * 5.0);
+    c = mix(vec3(0.62, 0.68, 0.70), vec3(0.97, 0.99, 1.0), glint * 0.8);
+  }
+
+  // Shared collectable glow so any pickup reads as catchable.
+  c += 0.22 * pulse * (1.0 - smoothstep(0.0, 0.45, length(v_uv - 0.5)));
+  if (alpha < 0.02) discard;
+  color = vec4(c, alpha);
+}`;
+
+// A failed shader compile otherwise shows up as a blank canvas with the real
+// message buried in an unhandled rejection. Put it on the page.
+function fatal(msg) {
+  document.getElementById('status').textContent = 'error — see below';
+  const pre = document.createElement('pre');
+  pre.style.cssText =
+    'max-width:90vw;overflow:auto;color:#ff9b9b;background:#221f2b;padding:10px;border-radius:6px;font-size:12px';
+  pre.textContent = msg;
+  document.body.appendChild(pre);
+  throw new Error(msg);
+}
+
+function compile(gl, type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    // Point at the offending line: WebGL reports "ERROR: 0:<line>".
+    const n = /:(\d+):/.exec(log)?.[1];
+    const ctx = n
+      ? src.split('\n').slice(Math.max(0, n - 3), Number(n) + 2).join('\n')
+      : '';
+    fatal((type === gl.VERTEX_SHADER ? 'vertex' : 'fragment') + ' shader:\n' + log + '\n' + ctx);
+  }
+  return s;
+}
+
+const wasm = await init();
+
+const canvas = document.getElementById('c');
+const [W, H] = dimensions();
+canvas.width = W; canvas.height = H;
+
+const gl = canvas.getContext('webgl2');
+if (!gl) throw new Error('WebGL2 unavailable');
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) fatal('link: ' + gl.getProgramInfoLog(prog));
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+  throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+// --- attribute layout: the other half of the #[repr(C)] contract ---
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, QUAD, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+// Must be >= Rust's instances capacity: blocks + paddle/ball/pickup + trail.
+const MAX_INSTANCES = 40 * 24 + 6 + 512;
+const STRIDE = 6 * 4;  // 6 floats, 4 bytes each — matches Instance
+
+const instBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+// Allocate once. Rust writes into this every frame with bufferSubData.
+gl.bufferData(gl.ARRAY_BUFFER, MAX_INSTANCES * STRIDE, gl.DYNAMIC_DRAW);
+
+gl.enableVertexAttribArray(1);
+gl.vertexAttribPointer(1, 4, gl.FLOAT, false, STRIDE, 0);   // rect  <- bytes 0..16
+gl.vertexAttribDivisor(1, 1);
+
+gl.enableVertexAttribArray(2);
+gl.vertexAttribPointer(2, 1, gl.FLOAT, false, STRIDE, 16);  // kind  <- bytes 16..20
+gl.vertexAttribDivisor(2, 1);
+
+gl.enableVertexAttribArray(3);
+gl.vertexAttribPointer(3, 1, gl.FLOAT, false, STRIDE, 20);  // burn  <- bytes 20..24
+gl.vertexAttribDivisor(3, 1);
+
+const uRes = gl.getUniformLocation(prog, 'res');
+const uCopd = gl.getUniformLocation(prog, 'copd');
+const uTime = gl.getUniformLocation(prog, 'time');
+
+// Rounded cells produce partial alpha at their edges; without blending that
+// alpha is simply ignored and the antialiasing does nothing.
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+gl.uniform2f(uRes, W, H);
+
+// instBuf stays bound to ARRAY_BUFFER — Rust's bufferSubData targets whatever
+// is bound, and nothing else binds after this point.
+const game = new GameHandle(gl);
+
+// Touch: track while dragging anywhere, so the paddle isn't hidden under a
+// finger parked on it. Mouse: track hover, no button needed.
+let dragging = false;
+function aim(e) {
+  const r = canvas.getBoundingClientRect();
+  game.set_paddle((e.clientX - r.left) * (W / r.width));
+}
+canvas.addEventListener('pointerdown', e => {
+  dragging = true;
+  canvas.setPointerCapture(e.pointerId);
+  aim(e);
+});
+canvas.addEventListener('pointermove', e => {
+  if (dragging || e.pointerType === 'mouse') aim(e);
+});
+for (const ev of ['pointerup', 'pointercancel'])
+  canvas.addEventListener(ev, () => { dragging = false; });
+
+const statusEl = document.getElementById('status');
+const pctEl = document.getElementById('pct');
+const fillEl = document.getElementById('fill');
+const chipRadiologist = document.getElementById('chip-radiologist');
+const chipPierce = document.getElementById('chip-pierce');
+const diagEl = document.getElementById('diag');
+const slamEl = document.getElementById('slam');
+const slamName = slamEl.querySelector('.name');
+const slamBlurb = slamEl.querySelector('.blurb');
+
+const overEl = document.getElementById('over');
+const overTitle = overEl.querySelector('.title');
+const overSub = overEl.querySelector('.sub');
+const overStats = overEl.querySelector('.stats');
+
+// Last-rendered HUD values, so the frame loop can skip unchanged DOM writes.
+const hud = { damage: -1, pierce: -1, radiologist: null, caughtSeq: 0, over: null };
+
+// Declared after the elements it touches: `const` is in the temporal dead
+// zone until its line runs, so a restart bound earlier would throw.
+function restart() {
+  game.restart();
+  slamEl.classList.remove('go');
+  overEl.classList.remove('show', 'win', 'lose');
+  hud.caughtSeq = 0;
+  hud.over = null;
+}
+document.getElementById('restart').addEventListener('click', restart);
+document.getElementById('again').addEventListener('click', restart);
+
+const SLAM_COLOR = {
+  cigarettes: '#ff6b6b',
+  pneumothorax: '#8fb8ff',
+  asbestos: '#e8f4f2',
+  radiologist: '#6fe3ff',
+};
+
+
+let prev = performance.now();
+function frame(now) {
+  const dt = (now - prev) / 1000;
+  prev = now;
+
+  const count = game.frame(dt);   // physics + upload, all in Rust
+
+  gl.uniform1f(uCopd, game.copd);
+  gl.uniform1f(uTime, now / 1000);
+  gl.clearColor(0.08, 0.07, 0.10, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+
+  // End state. Latched in Rust, so this only fires once per game.
+  const over = game.cleared ? 'win' : game.lost ? 'lose' : null;
+  if (over !== hud.over) {
+    hud.over = over;
+    if (over) {
+      const won = over === 'win';
+      // Winning means clearing every alveolus, which is the same event as
+      // destroying both lungs — so the two screens swap tone. The win is
+      // written as a loss and coloured green; the loss is written as a relief
+      // and coloured red.
+      //
+      // No "you win" / "you lose": stating the result explains the joke and
+      // kills it. These are the outcomes as a hospital would record them, and
+      // the player works out which one they wanted.
+      overTitle.textContent = won ? 'deceased' : 'discharged';
+      overSub.textContent = won
+        ? 'end-stage emphysema · bilateral · prognosis: excellent'
+        : 'lungs unremarkable · gas exchange preserved';
+      const t = game.elapsed;
+      const mins = Math.floor(t / 60), secs = Math.floor(t % 60);
+      // Read as a report line: what was lost, over how long, and the staging
+      // figure. GOLD is the actual COPD severity scale, so the percentage the
+      // game already tracks maps onto its four stages.
+      const gold = ['I', 'II', 'III', 'IV'][Math.min(3, Math.floor(game.copd * 4))];
+      overStats.textContent =
+        `${game.destroyed} alveoli lost · ${mins}:${String(secs).padStart(2, '0')}`
+        + ` · COPD ${Math.round(game.copd * 100)}% · GOLD ${gold}`;
+      overEl.classList.add('show', over);
+      slamEl.classList.remove('go'); // don't stack a pickup slam under it
+    } else {
+      overEl.classList.remove('show', 'win', 'lose');
+    }
+  }
+
+  statusEl.textContent = game.lost ? 'collapsed'
+    : game.cleared ? 'lungs destroyed'
+    : 'drag to aim';
+
+  // Only touch the DOM when a value actually changes — style writes are far
+  // more expensive than the reads, and this runs 60 times a second.
+  // The meter tracks tissue actually destroyed, not `copd`. COPD only moves
+  // when a carton is caught, so the bar used to sit frozen for minutes at a
+  // time while the player was visibly dismantling the lung. `damage` is the
+  // share of the lung that is gone, so the bar fills as the board clears and
+  // reads full exactly when the game ends.
+  const damage = game.damage, pierce = game.pierce, radiologist = game.radiologist;
+  if (damage !== hud.damage) {
+    hud.damage = damage;
+    const pctVal = Math.round(damage * 100);
+    pctEl.textContent = pctVal + '%';
+    fillEl.style.width = pctVal + '%';
+    // Healthy pink -> necrotic grey as damage accumulates.
+    const a = `hsl(${352 - damage * 40} ${70 - damage * 55}% ${64 - damage * 22}%)`;
+    const b = `hsl(${350 - damage * 40} ${62 - damage * 50}% ${48 - damage * 18}%)`;
+    fillEl.style.background = `linear-gradient(90deg, ${a}, ${b})`;
+  }
+  if (radiologist !== hud.radiologist) {
+    hud.radiologist = radiologist;
+    chipRadiologist.classList.toggle('hidden', !radiologist);
+  }
+  if (pierce !== hud.pierce) {
+    hud.pierce = pierce;
+    chipPierce.classList.toggle('hidden', pierce === 0);
+    chipPierce.textContent = `asbestos ×${pierce}`;
+  }
+  // Pickup announcement. Reading the counter is cheap; the strings allocate,
+  // so only touch them on an actual catch.
+  const seq = game.caught_seq;
+  if (seq !== hud.caughtSeq) {
+    hud.caughtSeq = seq;
+    const name = game.caught_name;
+    slamName.textContent = name;
+    slamBlurb.textContent = game.caught_blurb;
+    slamName.style.color = SLAM_COLOR[name] ?? '#fff2f2';
+    // Restart the animation: removing the class isn't enough on its own,
+    // the reflow is what makes the browser treat it as a new run.
+    slamEl.classList.remove('go');
+    void slamEl.offsetWidth;
+    slamEl.classList.add('go');
+  }
+
+  diagEl.textContent =
+    `bounces ${game.bounces}  asbestos ${game.asbestos_caught}  instances ${count}`;
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
