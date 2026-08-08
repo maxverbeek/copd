@@ -49,5 +49,39 @@
 
         doCheck = false;
       };
+
+      # Serving lives here rather than in the consuming config, so the allowlist
+      # sits next to the installPhase that decides which files exist. "/" is
+      # index.html via file_server's index resolution.
+      nixosModules.default =
+        { config, lib, ... }:
+        let
+          cfg = config.services.copd;
+          served = [ "/" "/pkg/copd.js" "/pkg/copd_bg.wasm" ];
+        in
+        {
+          options.services.copd = {
+            enable = lib.mkEnableOption "the copd static site";
+            hostName = lib.mkOption {
+              type = lib.types.str;
+              description = "Domain Caddy serves the site on.";
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            services.caddy.enable = true;
+            services.caddy.virtualHosts.${cfg.hostName}.extraConfig = ''
+              root * ${self.packages.${system}.default}
+
+              @allowed path ${lib.concatStringsSep " " served}
+              handle @allowed {
+                file_server
+              }
+              handle {
+                respond 404
+              }
+            '';
+          };
+        };
     };
 }
