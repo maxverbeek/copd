@@ -50,6 +50,20 @@
         doCheck = false;
       };
 
+      # `nix flake check` builds the site and runs the host-side unit tests. The
+      # wasm build can't run tests (no wasm runtime in the sandbox), so the test
+      # check reuses the same derivation with a native build/test phase instead.
+      checks.${system} = {
+        build = self.packages.${system}.default;
+        tests = self.packages.${system}.default.overrideAttrs (_: {
+          pname = "copd-tests";
+          buildPhase = "cargo build --offline";
+          doCheck = true;
+          checkPhase = "cargo test --offline";
+          installPhase = "touch $out";
+        });
+      };
+
       # Serving lives here rather than in the consuming config, so the allowlist
       # sits next to the installPhase that decides which files exist. "/" is
       # index.html via file_server's index resolution.
